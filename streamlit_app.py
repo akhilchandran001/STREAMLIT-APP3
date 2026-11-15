@@ -9,7 +9,6 @@ import requests
 import streamlit as st
 from PIL import Image, ImageFilter, ImageOps
 
-# Change this string to any unique secret topic name (must match rb.py)
 RELAY_TOPIC = "akhil-rmbg-bridge-8976"
 
 MODEL_URL = "https://huggingface.co/briaai/RMBG-1.4/resolve/main/onnx/model_quantized.onnx"
@@ -30,13 +29,11 @@ def get_session():
     return _SESSION
 
 
-def process_rmbg(image_bytes: bytes, erode_px: int = 1, feather_px: float = 0.5) -> bytes:
+def process_rmbg_mask(image_bytes: bytes, erode_px: int = 1, feather_px: float = 0.5) -> tuple[bytes, str]:
     sess = get_session()
     input_name = sess.get_inputs()[0].name
 
     orig = ImageOps.exif_transpose(Image.open(io.BytesIO(image_bytes))).convert("RGB")
-    orig_w, orig_h = orig.size
-
     resized = orig.resize((1024, 1024), Image.Resampling.BILINEAR)
     arr = (np.asarray(resized, dtype=np.float32) / 255.0) - 0.5
     inp = np.expand_dims(np.transpose(arr, (2, 0, 1)), axis=0)
@@ -45,19 +42,21 @@ def process_rmbg(image_bytes: bytes, erode_px: int = 1, feather_px: float = 0.5)
     pred = (pred - pred.min()) / (pred.max() - pred.min() + 1e-8)
 
     mask = Image.fromarray((pred * 255).astype(np.uint8), mode="L")
-    mask = mask.resize((orig_w, orig_h), Image.Resampling.BILINEAR)
 
     if erode_px > 0:
         mask = mask.filter(ImageFilter.MinFilter(erode_px * 2 + 1))
     if feather_px > 0:
         mask = mask.filter(ImageFilter.GaussianBlur(radius=feather_px))
 
-    result = orig.convert("RGBA")
-    result.putalpha(mask)
-
+    # Encode 1-channel mask (~40-120 KB) so ntfy.sh never rejects the return payload
     buf = io.BytesIO()
-    result.save(buf, format="PNG")
-    return buf.getvalue()
+    mask.save(buf, format="PNG", optimize=True)
+    data = buf.getvalue()
+    if len(data) > 400_000:
+        buf = io.BytesIO()
+        mask.save(buf, format="JPEG", quality=95)
+        return buf.getvalue(), "jpg"
+    return data, "png"
 
 
 def relay_worker(topic: str):
@@ -87,17 +86,18 @@ def relay_worker(topic: str):
                     seen_jobs.add(job_id)
 
                     img_bytes = requests.get(file_url, timeout=60).content
-                    png_bytes = process_rmbg(img_bytes)
+                    mask_bytes, ext = process_rmbg_mask(img_bytes)
 
-                    requests.put(
+                    put_res = requests.put(
                         f"https://ntfy.sh/{topic}",
-                        data=png_bytes,
+                        data=mask_bytes,
                         headers={
-                            "Filename": f"out_{job_id}.png",
+                            "Filename": f"mask_{job_id}.{ext}",
                             "Title": f"done:{job_id}",
                         },
                         timeout=60,
                     )
+                    put_res.raise_for_status()
         except Exception as e:
             print("Relay reconnect:", e)
             time.sleep(2)
