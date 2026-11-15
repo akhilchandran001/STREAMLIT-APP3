@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import threading
 import time
@@ -7,6 +8,9 @@ import onnxruntime as ort
 import requests
 import streamlit as st
 from PIL import Image, ImageFilter, ImageOps
+
+# Change this string to any unique secret topic name (must match rb.py)
+RELAY_TOPIC = "akhil-rmbg-bridge-8976"
 
 MODEL_URL = "https://huggingface.co/briaai/RMBG-1.4/resolve/main/onnx/model_quantized.onnx"
 MODEL_PATH = "/tmp/rmbg_1_4_quantized.onnx"
@@ -56,65 +60,56 @@ def process_rmbg(image_bytes: bytes, erode_px: int = 1, feather_px: float = 0.5)
     return buf.getvalue()
 
 
-def bot_worker(token: str):
-    base = f"https://api.telegram.org/bot{token}"
-    offset = None
+def relay_worker(topic: str):
+    seen_jobs = set()
+    url = f"https://ntfy.sh/{topic}/json"
+
     while True:
         try:
-            params = {"timeout": 25, "allowed_updates": ["message"]}
-            if offset is not None:
-                params["offset"] = offset
-            res = requests.get(f"{base}/getUpdates", params=params, timeout=35).json()
-            if not res.get("ok"):
-                time.sleep(3)
-                continue
+            with requests.get(url, stream=True, timeout=75) as resp:
+                for line in resp.iter_lines():
+                    if not line:
+                        continue
+                    event = json.loads(line.decode("utf-8"))
+                    if event.get("event") != "message":
+                        continue
 
-            for upd in res.get("result", []):
-                offset = upd["update_id"] + 1
-                msg = upd.get("message") or {}
-                chat_id = msg.get("chat", {}).get("id")
-                if not chat_id:
-                    continue
+                    title = event.get("title", "")
+                    attachment = event.get("attachment") or {}
+                    file_url = attachment.get("url")
 
-                file_id = None
-                if msg.get("photo"):
-                    file_id = msg["photo"][-1]["file_id"]
-                elif msg.get("document") and str(msg["document"].get("mime_type", "")).startswith("image/"):
-                    file_id = msg["document"]["file_id"]
+                    if not title.startswith("req:") or not file_url:
+                        continue
 
-                if not file_id:
-                    continue
+                    job_id = title.split(":", 1)[1]
+                    if job_id in seen_jobs:
+                        continue
+                    seen_jobs.add(job_id)
 
-                requests.post(f"{base}/sendChatAction", json={"chat_id": chat_id, "action": "upload_document"})
-                file_info = requests.get(f"{base}/getFile", params={"file_id": file_id}, timeout=20).json()
-                file_path = file_info["result"]["file_path"]
-                img_bytes = requests.get(f"https://api.telegram.org/file/bot{token}/{file_path}", timeout=60).content
+                    img_bytes = requests.get(file_url, timeout=60).content
+                    png_bytes = process_rmbg(img_bytes)
 
-                png_bytes = process_rmbg(img_bytes)
-
-                # Must use sendDocument so Telegram preserves the transparent PNG alpha channel
-                requests.post(
-                    f"{base}/sendDocument",
-                    data={"chat_id": chat_id, "caption": "HD Transparent PNG (RMBG-1.4)"},
-                    files={"document": ("nobg.png", png_bytes, "image/png")},
-                    timeout=60,
-                )
+                    requests.put(
+                        f"https://ntfy.sh/{topic}",
+                        data=png_bytes,
+                        headers={
+                            "Filename": f"out_{job_id}.png",
+                            "Title": f"done:{job_id}",
+                        },
+                        timeout=60,
+                    )
         except Exception as e:
-            print("Worker error:", e)
-            time.sleep(3)
+            print("Relay reconnect:", e)
+            time.sleep(2)
 
 
 @st.cache_resource
-def start_background_worker(token: str):
-    t = threading.Thread(target=bot_worker, args=(token,), daemon=True)
+def start_worker(topic: str):
+    t = threading.Thread(target=relay_worker, args=(topic,), daemon=True)
     t.start()
     return True
 
 
-st.title("RMBG-1.4 Cloud Worker")
-token = st.secrets.get("BOT_TOKEN", "")
-if token:
-    start_background_worker(token)
-    st.success("Worker active! Send any photo or image file to your Telegram bot.")
-else:
-    st.error("Add BOT_TOKEN to Streamlit Secrets to start the worker.")
+st.title("RMBG-1.4 HTTP Relay Worker")
+start_worker(RELAY_TOPIC)
+st.success("Relay worker active! Ready for rb.py requests.")
