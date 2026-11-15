@@ -11,8 +11,9 @@ from PIL import Image, ImageFilter, ImageOps
 
 RELAY_TOPIC = "akhil-rmbg-bridge-8976"
 
-MODEL_URL = "https://huggingface.co/briaai/RMBG-1.4/resolve/main/onnx/model_quantized.onnx"
-MODEL_PATH = "/tmp/rmbg_1_4_quantized.onnx"
+# Full-precision FP32 RMBG-1.4 (~176 MB) — eliminates INT8 speckles on flat fills
+MODEL_URL = "https://huggingface.co/briaai/RMBG-1.4/resolve/main/onnx/model.onnx"
+MODEL_PATH = "/tmp/rmbg_1_4_fp32.onnx"
 _SESSION = None
 
 
@@ -20,43 +21,48 @@ def get_session():
     global _SESSION
     if _SESSION is None:
         if not os.path.exists(MODEL_PATH):
-            with requests.get(MODEL_URL, stream=True, timeout=60) as r:
+            with requests.get(MODEL_URL, stream=True, timeout=120) as r:
                 r.raise_for_status()
                 with open(MODEL_PATH, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=8192):
+                    for chunk in r.iter_content(chunk_size=65536):
                         f.write(chunk)
         _SESSION = ort.InferenceSession(MODEL_PATH, providers=["CPUExecutionProvider"])
     return _SESSION
 
 
-def process_rmbg_mask(image_bytes: bytes, erode_px: int = 1, feather_px: float = 0.5) -> tuple[bytes, str]:
+def process_rmbg_mask(
+    image_bytes: bytes,
+    low_thresh: int = 25,
+    high_thresh: int = 205,
+    erode_px: int = 0,
+    feather_px: float = 0.0,
+) -> bytes:
     sess = get_session()
     input_name = sess.get_inputs()[0].name
 
     orig = ImageOps.exif_transpose(Image.open(io.BytesIO(image_bytes))).convert("RGB")
     resized = orig.resize((1024, 1024), Image.Resampling.BILINEAR)
+
+    # Exact Transformers.js normalization: mean=0.5, std=1.0
     arr = (np.asarray(resized, dtype=np.float32) / 255.0) - 0.5
     inp = np.expand_dims(np.transpose(arr, (2, 0, 1)), axis=0)
 
     pred = sess.run(None, {input_name: inp})[0][0, 0]
-    pred = (pred - pred.min()) / (pred.max() - pred.min() + 1e-8)
+    alpha = np.clip(pred * 255.0, 0, 255).astype(np.float32)
 
-    mask = Image.fromarray((pred * 255).astype(np.uint8), mode="L")
+    # Clean up semi-transparent interior artifacts while keeping smooth anti-aliased edges
+    alpha = np.clip((alpha - low_thresh) * (255.0 / max(1, high_thresh - low_thresh)), 0, 255)
+    mask = Image.fromarray(alpha.astype(np.uint8), mode="L")
 
     if erode_px > 0:
         mask = mask.filter(ImageFilter.MinFilter(erode_px * 2 + 1))
     if feather_px > 0:
         mask = mask.filter(ImageFilter.GaussianBlur(radius=feather_px))
 
-    # Encode 1-channel mask (~40-120 KB) so ntfy.sh never rejects the return payload
+    # Lossless 1-channel PNG mask (~20-90 KB, always well under ntfy.sh limits)
     buf = io.BytesIO()
     mask.save(buf, format="PNG", optimize=True)
-    data = buf.getvalue()
-    if len(data) > 400_000:
-        buf = io.BytesIO()
-        mask.save(buf, format="JPEG", quality=95)
-        return buf.getvalue(), "jpg"
-    return data, "png"
+    return buf.getvalue()
 
 
 def relay_worker(topic: str):
@@ -86,13 +92,13 @@ def relay_worker(topic: str):
                     seen_jobs.add(job_id)
 
                     img_bytes = requests.get(file_url, timeout=60).content
-                    mask_bytes, ext = process_rmbg_mask(img_bytes)
+                    mask_bytes = process_rmbg_mask(img_bytes)
 
                     put_res = requests.put(
                         f"https://ntfy.sh/{topic}",
                         data=mask_bytes,
                         headers={
-                            "Filename": f"mask_{job_id}.{ext}",
+                            "Filename": f"mask_{job_id}.png",
                             "Title": f"done:{job_id}",
                         },
                         timeout=60,
@@ -110,6 +116,6 @@ def start_worker(topic: str):
     return True
 
 
-st.title("RMBG-1.4 HTTP Relay Worker")
+st.title("RMBG-1.4 FP32 Relay Worker")
 start_worker(RELAY_TOPIC)
-st.success("Relay worker active! Ready for rb.py requests.")
+st.success("FP32 worker active! Ready for rb.py requests.")
