@@ -1,25 +1,16 @@
-import asyncio
 import io
 import os
+import threading
+import time
 import numpy as np
 import onnxruntime as ort
 import requests
 import streamlit as st
-from PIL import Image, ImageFilter
-from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
-from starlette.routing import Route
+from PIL import Image, ImageFilter, ImageOps
 
 MODEL_URL = "https://huggingface.co/briaai/RMBG-1.4/resolve/main/onnx/model_quantized.onnx"
 MODEL_PATH = "/tmp/rmbg_1_4_quantized.onnx"
 _SESSION = None
-
-
-def get_api_key() -> str:
-    try:
-        return st.secrets.get("API_KEY", os.environ.get("API_KEY", "akhil-rmbg-secret"))
-    except Exception:
-        return os.environ.get("API_KEY", "akhil-rmbg-secret")
 
 
 def get_session():
@@ -39,7 +30,7 @@ def process_rmbg(image_bytes: bytes, erode_px: int = 1, feather_px: float = 0.5)
     sess = get_session()
     input_name = sess.get_inputs()[0].name
 
-    orig = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    orig = ImageOps.exif_transpose(Image.open(io.BytesIO(image_bytes))).convert("RGB")
     orig_w, orig_h = orig.size
 
     resized = orig.resize((1024, 1024), Image.Resampling.BILINEAR)
@@ -65,25 +56,65 @@ def process_rmbg(image_bytes: bytes, erode_px: int = 1, feather_px: float = 0.5)
     return buf.getvalue()
 
 
-async def remove_bg_endpoint(request: Request):
-    if request.headers.get("X-API-Key") != get_api_key():
-        return JSONResponse({"error": "Invalid API Key"}, status_code=401)
+def bot_worker(token: str):
+    base = f"https://api.telegram.org/bot{token}"
+    offset = None
+    while True:
+        try:
+            params = {"timeout": 25, "allowed_updates": ["message"]}
+            if offset is not None:
+                params["offset"] = offset
+            res = requests.get(f"{base}/getUpdates", params=params, timeout=35).json()
+            if not res.get("ok"):
+                time.sleep(3)
+                continue
 
-    form = await request.form()
-    upload = form.get("file")
-    if upload is None:
-        return JSONResponse({"error": "Send image in 'file' form field"}, status_code=400)
+            for upd in res.get("result", []):
+                offset = upd["update_id"] + 1
+                msg = upd.get("message") or {}
+                chat_id = msg.get("chat", {}).get("id")
+                if not chat_id:
+                    continue
 
-    img_bytes = await upload.read()
-    erode_px = int(form.get("erode", 1))
-    feather_px = float(form.get("feather", 0.5))
+                file_id = None
+                if msg.get("photo"):
+                    file_id = msg["photo"][-1]["file_id"]
+                elif msg.get("document") and str(msg["document"].get("mime_type", "")).startswith("image/"):
+                    file_id = msg["document"]["file_id"]
 
-    # Run CPU inference in a worker thread so Streamlit health checks stay responsive
-    png_bytes = await asyncio.to_thread(process_rmbg, img_bytes, erode_px, feather_px)
-    return Response(content=png_bytes, media_type="image/png")
+                if not file_id:
+                    continue
+
+                requests.post(f"{base}/sendChatAction", json={"chat_id": chat_id, "action": "upload_document"})
+                file_info = requests.get(f"{base}/getFile", params={"file_id": file_id}, timeout=20).json()
+                file_path = file_info["result"]["file_path"]
+                img_bytes = requests.get(f"https://api.telegram.org/file/bot{token}/{file_path}", timeout=60).content
+
+                png_bytes = process_rmbg(img_bytes)
+
+                # Must use sendDocument so Telegram preserves the transparent PNG alpha channel
+                requests.post(
+                    f"{base}/sendDocument",
+                    data={"chat_id": chat_id, "caption": "HD Transparent PNG (RMBG-1.4)"},
+                    files={"document": ("nobg.png", png_bytes, "image/png")},
+                    timeout=60,
+                )
+        except Exception as e:
+            print("Worker error:", e)
+            time.sleep(3)
 
 
-app = st.App(
-    "ui.py",
-    routes=[Route("/api/remove-bg", remove_bg_endpoint, methods=["POST"])],
-)
+@st.cache_resource
+def start_background_worker(token: str):
+    t = threading.Thread(target=bot_worker, args=(token,), daemon=True)
+    t.start()
+    return True
+
+
+st.title("RMBG-1.4 Cloud Worker")
+token = st.secrets.get("BOT_TOKEN", "")
+if token:
+    start_background_worker(token)
+    st.success("Worker active! Send any photo or image file to your Telegram bot.")
+else:
+    st.error("Add BOT_TOKEN to Streamlit Secrets to start the worker.")
