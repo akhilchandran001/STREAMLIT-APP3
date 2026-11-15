@@ -1,0 +1,7 @@
+streamlit>=1.65.0
+starlette
+python-multipart
+onnxruntime
+pillow
+numpy
+requests
